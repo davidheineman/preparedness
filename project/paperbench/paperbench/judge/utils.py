@@ -1,31 +1,97 @@
+import os
 import re
 from pathlib import Path
+from typing import AsyncGenerator, Generator
 
+import structlog.stdlib
 from drain3 import TemplateMiner
-from paperbench.utils import get_logger
 
-logger = get_logger(__name__)
+from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface
+from paperbench.infra.alcatraz import (
+    file_exists_on_computer,
+    file_is_symlink_on_computer,
+    get_mtime_on_computer,
+    read_text_on_computer,
+    walk_dir_with_mtimes_on_computer,
+)
+
+logger = structlog.stdlib.get_logger(component=__name__)
+
+SIZE_LIMIT_BYTES = 200_000  # read at most 200 kB per file
 
 
-def get_model_context_window_length(model: str) -> int:
-    max_context_window_lengths = {
-        "gpt-4o-mini": 128000,
-        "gpt-4o-mini-2024-07-18": 128000,
-        "gpt-4o": 128000,
-        "gpt-4o-2024-08-06": 128000,
-        "o1-mini": 128000,
-        "o1-mini-2024-09-12": 128000,
-        "o1": 200000,
-        "o1-2024-12-17": 200000,
-        "o3-mini-2024-12-17": 128000,
-        "o3-mini-2025-01-31": 200000,
-        "o3-mini": 200000,
-        "o1-preview": 128000,
-        "gpt-4-turbo": 128000,
-    }
-    if model not in max_context_window_lengths:
-        raise ValueError(f"Context window length not defined for model {model}!")
-    return max_context_window_lengths[model]
+def safe_read_file(file_path: Path, max_bytes: int | None = None) -> str:
+    """
+    Try to read a file (up to max_bytes bytes), with robustness to different encodings.
+    (Without this, we sometimes get `'utf-8' codec can't decode byte 0xa4 in position 64: invalid start byte`)
+    """
+    try:
+        # Try utf-8 first
+        with file_path.open(encoding="utf-8") as f:
+            return f.read(max_bytes)
+    except UnicodeDecodeError:
+        # Try latin1 if utf-8 fails
+        with file_path.open(encoding="latin1") as f:
+            return f.read(max_bytes)
+
+
+async def file_exists(file_path: Path, computer: ComputerInterface | None) -> bool:
+    """Generic function to check if a file exists; on the computer or locally."""
+    return await file_exists_on_computer(computer, file_path) if computer else file_path.exists()
+
+
+async def read_file_content(file_path: Path, computer: ComputerInterface | None) -> str:
+    """Generic function to read the content of a file; on the computer or locally."""
+    return (
+        await read_text_on_computer(computer, file_path, SIZE_LIMIT_BYTES)
+        if computer
+        else safe_read_file(file_path, SIZE_LIMIT_BYTES)
+    )
+
+
+async def read_file_mtime(file_path: Path, computer: ComputerInterface | None) -> float:
+    """Generic function to read the modification time of a file; on the computer or locally."""
+    return (
+        await get_mtime_on_computer(computer, file_path) if computer else file_path.stat().st_mtime
+    )
+
+
+async def is_symlink(file_path: Path, computer: ComputerInterface | None) -> bool:
+    """Generic function to check if a file is a symlink; on the computer or locally."""
+    return (
+        await file_is_symlink_on_computer(computer, file_path)
+        if computer
+        else file_path.is_symlink()
+    )
+
+
+def walk_dir_with_mtimes_locally(
+    dir_path: Path,
+) -> Generator[tuple[str, list[str], list[str], list[float]], None, None]:
+    """like os.walk, but also yields the mtimes of the files"""
+    for root, dirs, files in os.walk(dir_path):
+        mtimes = []
+        for f in files:
+            full_path = os.path.join(root, f)
+            try:
+                st = os.stat(full_path)
+                mtimes.append(st.st_mtime)
+            except OSError:
+                mtimes.append(0.0)
+        yield root, dirs, files, mtimes
+
+
+async def walk_dir_with_mtimes(
+    dir_path: Path, computer: ComputerInterface | None
+) -> AsyncGenerator[tuple[str, list[str], list[str], list[float]], None]:
+    """
+    Generic function for running equivalent of os.walk + mtimes; on the computer or locally."""
+    if computer:
+        async for entry in walk_dir_with_mtimes_on_computer(computer, dir_path):
+            yield entry
+    else:
+        for entry in walk_dir_with_mtimes_locally(dir_path):
+            yield entry
 
 
 def sanitize_line(line: str) -> str:
@@ -117,7 +183,7 @@ if __name__ == "__main__":
     print(reduce_log(input_text))
 
 
-def format_file(file_path: Path, file_content: str):
+def format_file(file_path: Path, file_content: str) -> str:
     return f"""<FILE:{file_path}>
 {file_content if file_content.strip() else "(FILE IS EMPTY)"}
 </FILE:{file_path}>"""

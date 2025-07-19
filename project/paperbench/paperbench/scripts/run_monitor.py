@@ -2,14 +2,19 @@ import argparse
 import asyncio
 import datetime
 import json
+import shutil
+import tarfile
+import tempfile
 from pathlib import Path
+from typing import Any
+
+import structlog.stdlib
+from tqdm.asyncio import tqdm_asyncio
 
 from paperbench.monitor.create_monitor import create_monitor
 from paperbench.paper_registry import paper_registry
-from paperbench.utils import get_logger
-from tqdm.asyncio import tqdm_asyncio
 
-logger = get_logger(__name__)
+logger = structlog.stdlib.get_logger(component=__name__)
 
 
 def get_paper_id_from_run_id(run_id: str) -> str:
@@ -20,7 +25,7 @@ def get_paper_id_from_run_id(run_id: str) -> str:
 async def monitor_single_log(
     run_dir: Path,
     monitor_type: str,
-) -> dict:
+) -> dict[str, Any] | None:
     """
     Monitor a single run's log with the specified monitor.
     """
@@ -28,13 +33,33 @@ async def monitor_single_log(
 
     # look at latest checkpoint
     checkpoints = [
-        i for i in list(run_dir.glob("*-GMT")) + list(run_dir.glob("*-UTC")) if i.is_dir()
+        i
+        for i in list(run_dir.glob("submissions/*-GMT")) + list(run_dir.glob("submissions/*-UTC"))
+        if i.is_dir()
     ]
     if len(checkpoints) == 0:
         logger.warning(f"No checkpoints found for {run_id}")
         return None
-    latest_checkpoint = sorted(checkpoints, key=lambda x: x.stem)[-1]
-    log_file = latest_checkpoint / "logs" / "agent.log"
+
+    latest_checkpoint = None
+
+    for checkpoint in sorted(checkpoints, key=lambda x: x.stem, reverse=True):
+        if (checkpoint / "submission.tar.gz").exists():
+            latest_checkpoint = checkpoint
+            break
+
+    if not latest_checkpoint:
+        logger.warning(f"No submission.tar.gz found for {run_id}")
+        return None
+
+    with tempfile.TemporaryDirectory() as extract_to:
+        with tarfile.open(latest_checkpoint / "submission.tar.gz", "r:gz") as tar:
+            tar.extractall(path=extract_to)
+
+        matches = list(Path(extract_to).glob("**/logs/agent.log"))
+        assert len(matches) == 1, f"Expected exactly one agent.log file, found {len(matches)}"
+        log_file = latest_checkpoint / "agent.log"
+        shutil.copy(matches[0], log_file)
 
     paper_id = get_paper_id_from_run_id(run_id)
 
@@ -53,7 +78,7 @@ async def monitor_single_log(
     )
 
     # Run monitor on the log file
-    result = await asyncio.to_thread(monitor.check_log, log_file)
+    result = await asyncio.to_thread(monitor.check_log, log_file.as_posix())
 
     return {
         "run_group_id": run_dir.parent.name,
@@ -79,7 +104,7 @@ async def monitor_single_log(
 async def monitor_run_group(
     group_dir: Path,
     monitor_type: str,
-) -> list:
+) -> list[dict[str, Any] | None]:
     """Monitor all runs in a run group directory."""
     run_group_id = group_dir.name
 
@@ -102,11 +127,11 @@ async def monitor_run_group(
 async def monitor_multiple_run_groups(
     logs_dir: Path,
     monitor_type: str,
-    run_groups: list = None,
-) -> dict:
+    run_groups: list[str] | None = None,
+) -> dict[str, Any] | None:
     """Run monitor on multiple run groups that are in a directory of run groups."""
     if not logs_dir.exists():
-        logger.error(f"Logs directory {logs_dir} does not exist")
+        logger.exception(f"Logs directory {logs_dir} does not exist")
         return None
 
     # Get all available run groups in the logs directory
@@ -159,11 +184,11 @@ async def monitor_multiple_run_groups(
 
 
 async def main(
-    monitor_type: str = "basic",
-    logs_dir: Path = None,
-    run_groups: list = None,
-    out_dir: Path = None,
-):
+    monitor_type: str,
+    logs_dir: Path,
+    run_groups: list[str] | None = None,
+    out_dir: Path | None = None,
+) -> None:
     """
     Main function to run the monitor on a directory of logs.
     """

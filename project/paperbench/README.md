@@ -37,30 +37,20 @@ PaperBench runs in 3 stages:
 2. **Reproduction**: The agent's submitted codebase is executed in a fresh second container with GPU access so that results from executing the codebase are obtained. This creates the _executed submission_.
 3. **Grading**: The _executed submission_ is graded using paper's rubric. A third container is created where the judge is run.
 
-## Nanoeval and Alcatraz pre-requisites
-
-PaperBench uses [nanoeval](../nanoeval) (a high performance evaluation module) and [alcatraz](../alcatraz) (a containerization module) to orchestrate runs.
-
-First, install nanoeval and alcatraz by following the [instructions](../../README.md) at the root of this monorepo.
-
 ## PaperBench Setup
 
 All commands in this README should be run from the [root](./) of the PaperBench project.
 
 ### Installation
 
-Install PaperBench by running:
+Install PaperBench with [uv](https://docs.astral.sh/uv/)[^1]
 
 ```console
-pip install -e .
+UV_GIT_LFS=1 uv sync
 ```
 
-**(Optional)** If you're committing code, you can install the pre-commit hooks by running:
-
-```console
-pip install pre-commit
-pre-commit install
-```
+[^1]: If you get an LFS error here, try cleaning your uv cache: `uv cache clean` and then re-running the command. See
+    [this issue comment](https://github.com/astral-sh/uv/issues/12938#issuecomment-2816186433)
 
 ### Get the data
 
@@ -70,7 +60,6 @@ The dataset is stored using [Git-LFS](https://git-lfs.com/). Download and instal
 git lfs fetch --all
 git lfs pull
 ```
-
 
 ### Environment variables
 
@@ -109,13 +98,12 @@ Running agents with nanoeval and alcatraz requires Docker, which you can install
 
 PaperBench requires the following Docker images to be built before it can run:
 
+- [paperbench/Dockerfile.base](paperbench/Dockerfile.base): The base environment for agents which contains basic packages like `curl`, `git`, `python`, etc. and a Conda environment that can be used to run the agents. We re-use this docker image if users request grading to occur on a computer with `paperbench.judge.grade_locally=false`
 - [paperbench/reproducer.Dockerfile](paperbench/reproducer.Dockerfile): The environment in which the submission is reproduced.
-- [paperbench/grader.Dockerfile](paperbench/grader.Dockerfile): The environment in which the judge is run to grade the agent's submission.
-- [paperbench/agents/Dockerfile.base](paperbench/agents/Dockerfile.base): The base environment for agents, which contains basic packages like `curl`, `git`, `python`, etc. and a Conda environment that can be used to run the agents.
 
 You will need to build the images for each agent that you want to run. We provide the following agents out-of-the-box:
 
-- [paperbench/agents/dummy/Dockerfile](paperbench/agents/dummy/Dockerfile): A agent for that creates a dummy submission, useful for testing the eval end-to-end.
+- [paperbench/solvers/dummy/solver.py](paperbench/solvers/dummy/solver.py): A agent for that creates a dummy submission, useful for testing the eval end-to-end.
 - [paperbench/agents/aisi-basic-agent/Dockerfile](paperbench/agents/aisi-basic-agent/Dockerfile): Simple ReAct style agents with tools available to them.
 
 For convenience, we've provided a [script](paperbench/scripts/build-docker-images.sh) that builds all the above images:
@@ -133,7 +121,7 @@ Configurations for each agent are stored in the [paperbench/agents/](paperbench/
 To see all configurable options for PaperBench, run:
 
 ```bash
-python -m paperbench.nano.entrypoint --help
+uv run python -m paperbench.nano.entrypoint --help
 ```
 
 To use our default solver (`ExternalPythonCodingSolver`), you must set:
@@ -147,12 +135,11 @@ To use our default solver (`ExternalPythonCodingSolver`), you must set:
 To test that things are set up correctly, run the dummy agent with the dummy judge (`paperbench.judge.scaffold=dummy`) on the debug split. Note this dummy agent is different to the [default nanoeval "dummy" agent](../nanoeval/nanoeval/solvers/computer_tasks/solver.py); our dummy agent tests several aspects of the infrastructure and makes a toy submission.
 
 ```bash
-python -m paperbench.nano.entrypoint \
+uv run python -m paperbench.nano.entrypoint \
     paperbench.paper_split=debug \
-    paperbench.solver=paperbench.nano.eval:ExternalPythonCodingSolver \
-    paperbench.solver.agent_id=dummy \
+    paperbench.solver=paperbench.solvers.dummy.solver:PaperBenchDummySolver \
     paperbench.solver.cluster_config=alcatraz.clusters.local:LocalConfig \
-    paperbench.solver.cluster_config.image=dummy:latest \
+    paperbench.solver.cluster_config.image=pb-env:latest \
     paperbench.judge.scaffold=dummy \
     runner.recorder=nanoeval.json_recorder:json_recorder
 ```
@@ -160,7 +147,7 @@ python -m paperbench.nano.entrypoint \
 To run a development configuration of BasicAgent that uses `gpt-4o-mini` and runs for 5 minutes, use `paperbench.solver.agent_id=aisi-basic-agent-openai-dev`. To run that agent on the full PaperBench dataset, execute:
 
 ```bash
-python -m paperbench.nano.entrypoint \
+uv run python -m paperbench.nano.entrypoint \
     paperbench.solver=paperbench.nano.eval:ExternalPythonCodingSolver \
     paperbench.solver.agent_id=aisi-basic-agent-openai-dev \
     paperbench.solver.cluster_config=alcatraz.clusters.local:LocalConfig \
@@ -172,6 +159,39 @@ python -m paperbench.nano.entrypoint \
 To set the concurrency, simply specify `runner.concurrency=<int>` in the command.
 **Note** You may use a custom solver: set `paperbench.solver` to point to your custom solver class. This solver should be a `PythonCodingSolver` class.
 
+### I have submissions and just want to run grading
+
+If you have already run your agent or you are a human and have submissions
+ready to be graded, you can skip the agent rollout by using our provided
+`PBDirectSubmissionSolver`. Place your submissions as folders in a directory (say
+in `path/to/foo/`) in the following format:
+
+```plaintext
+foo/
+    <paper_id_1>/
+        submission/
+        other_submission/
+        ...
+        (i.e. multiple submissions for the same paper (intended for when paperbench.n_tries > 1). 
+        Single submission is also fine. Missing submissions for a try will just
+        be graded as scoring 0 for that try)
+    ...
+    (does not need a folder for each paper, missing papers will be treated as
+    missing submissions, i.e. graded as scoring 0)
+```
+
+Then run the paperbench like above but with appropriately configured `PBDirectSubmissionSolver`, e.g.:
+
+```bash
+uv run python -m paperbench.nano.entrypoint \
+    paperbench.paper_split=debug \
+    paperbench.solver=paperbench.solvers.direct_submission.solver:PBDirectSubmissionSolver \
+    paperbench.solver.submissions_dir=path/to/foo/ \
+    paperbench.solver.cluster_config=alcatraz.clusters.local:LocalConfig \
+    paperbench.solver.cluster_config.image=pb-env:latest \
+    paperbench.judge.scaffold=dummy \
+    runner.recorder=nanoeval.json_recorder:json_recorder
+```
 
 ## Retrieving results
 
@@ -183,7 +203,15 @@ In each run directory there is:
 - `run.log`: The log for that run.
 - `status.json`: The status of that run.
 - `metadata.json`: Metadata for that run.
-- `pb_result.json`: The grading result for that run.
+- `grade.json`: The grading result for that run.
+- `agent.log`: (optional) Rollout log from the solver. If present, the monitoring step will run and the run's grade will be marked with `"monitor_ran": true`.
+- A submissions directory, containing multiple timestamped submission directories (e.g., `2025-03-28T10-34-35-UTC`), each with:
+    - `log.json`: Logs from this submission attempt
+    - `submission.tar.gz`: The archived submission files
+    - If the submission was executed/graded, the directory may also contain:
+        - `submission_executed_grader_output_0.json`: Output from the grader.
+        - `submission_executed_metadata.json`: Metadata about the execution.
+        - `submission_executed.tar.gz`: The archived files after execution.
 
 Snapshots from the agent rollout are also stored in the run directory. An initial snapshot is created when the agent starts, and a final snapshot is created when the agent finishes. Intermediate snapshots are created throughout the agent rollout and can be set via `paperbench.solver.upload_interval_messages` or `paperbench.solver.upload_interval_seconds`.
 
@@ -191,21 +219,23 @@ Snapshots from the agent rollout are also stored in the run directory. An initia
 ```
 runs/
 ├── <run_group_id>/
-│   ├── <run_id>/
-│   │   ├── <inital_snapshot_metadata.json>
-│   │   ├── <inital_snapshot.tar.gz>
-│   │   ├── ...
-│   │   ├── ...
-│   │   ├── <final_snapshot_metadata.json>
-│   │   ├── <final_snapshot.tar.gz>
-│   │   ├── <final_snapshot>_repro.tar.gz>
-│   │   ├── <final_snapshot>_repro_grader_output_0.json
-│   │   ├── <final_snapshot>_repro_metadata.json
-│   │   ├── metadata.json
-│   │   ├── pb_result.json
-│   │   ├── status.json
-│   │   └── run.log
 │   ├── group.log
+│   ├── <run_id>/
+│   │   ├── metadata.json
+│   │   ├── grade.json
+│   │   ├── status.json
+│   │   ├── run.log
+│   │   ├── agent.log
+│   │   ├── submissions/
+│   │   │   ├── <timestamp-1>/
+│   │   │   │   ├── log.json
+│   │   │   │   └── submission.tar.gz
+│   │   │   └── <timestamp-2>/
+│   │   │       ├── log.json
+│   │   │       ├── submission.tar.gz
+│   │   │       ├── submission_executed_grader_output_0.json  # if graded
+│   │   │       ├── submission_executed_metadata.json  # if executed
+│   │   │       └── submission_executed.tar.gz  # if executed
 │   └── <other_run_ids>/...
 └── <other_run_group_ids>/...
 ```
@@ -242,13 +272,13 @@ The PaperBench dataset is stored in the [papers](data/papers) directory. Each pa
 We include a web app to view and edit rubrics. To view a paper's rubric that is in `PAPER_DIR` with filename `RUBRIC_FILE_NAME`:
 
 ```bash
-python paperbench/gui/app.py --path-to-paper <PAPER_DIR> --rubric-file-name <RUBRIC_FILE_NAME>
+uv run python paperbench/gui/app.py --path-to-paper <PAPER_DIR> --rubric-file-name <RUBRIC_FILE_NAME>
 ```
 
 To view a rubric that has been graded (see below), pass the `--graded` flag:
 
 ```bash
-python paperbench/gui/app.py --path-to-paper <PAPER_DIR> --rubric-file-name <RUBRIC_FILE_NAME> --graded
+uv run python paperbench/gui/app.py --path-to-paper <PAPER_DIR> --rubric-file-name <RUBRIC_FILE_NAME> --graded
 ```
 
 ## JudgeEval

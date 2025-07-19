@@ -7,15 +7,16 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Generic, Self, TypeVar
 
-import chz
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, model_validator
+from typing_extensions import override
+
+import chz
 from nanoeval.asyncio_utils import HasAsyncContextManager
 from nanoeval.evaluation import Eval, Task
 from nanoeval.metrics.standard import compute_default_metrics
 from nanoeval.recorder import get_recorder
-from pydantic import BaseModel, model_validator
-from typing_extensions import override
 
 
 class Question(BaseModel):
@@ -26,6 +27,7 @@ class Question(BaseModel):
     # reproducible way. If None, the solver should be deterministic.
     image: str | None = None  # solver code assumes image is in base64 encoding
     seed: int | None = 42
+    metadata: dict[str, Any] = {}
 
     # Whether the question may have multiple correct answers.
     # If True, the solver should return a set of picked indices, which must match correct_indices to be marked correct.

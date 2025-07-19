@@ -1,7 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from paperbench.utils import get_paperbench_data_dir, load_yaml
+import structlog.stdlib
+
+from paperbench.utils import get_paperbench_data_dir, load_yaml_dict
+
+logger = structlog.stdlib.get_logger(component=__name__)
 
 
 @dataclass(frozen=True)
@@ -16,7 +23,7 @@ class Paper:
     blacklist: Path
     rubric: Path
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert isinstance(self.id, str), "Paper id must be a string."
         assert isinstance(self.title, str), "Paper title must be a string."
         assert isinstance(self.paper_pdf, Path), "Paper PDF must be a Path."
@@ -30,7 +37,7 @@ class Paper:
         assert len(self.title) > 0, "Paper title cannot be empty."
 
     @staticmethod
-    def from_dict(data: dict) -> "Paper":
+    def from_dict(data: dict[str, Any]) -> Paper:
         try:
             return Paper(
                 id=data["id"],
@@ -44,7 +51,7 @@ class Paper:
                 blacklist=data["blacklist"],
             )
         except KeyError as e:
-            raise ValueError(f"Missing key {e} in paper config!")
+            raise ValueError("Missing key in paper config!") from e
 
 
 class PaperRegistry:
@@ -52,7 +59,7 @@ class PaperRegistry:
         """Fetch the paper from the registry."""
 
         config_path = self.get_papers_dir() / paper_id / "config.yaml"
-        config = load_yaml(config_path)
+        config = load_yaml_dict(config_path)
 
         paper_pdf = self.get_papers_dir() / paper_id / "paper.pdf"
         paper_md = self.get_papers_dir() / paper_id / "paper.md"

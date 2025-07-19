@@ -38,6 +38,16 @@ import docker.types
 import pydantic
 import tenacity
 import yaml
+from docker import DockerClient
+from docker.errors import APIError, NotFound
+from docker.models.containers import Container, ExecResult
+from docker.models.networks import Network
+from filelock import Timeout as LockTimeout
+from filelock import UnixFileLock
+from jupyter_client.asynchronous.client import AsyncKernelClient
+from jupyter_client.manager import AsyncKernelManager
+from pydantic import BaseModel, ConfigDict, Extra, Field, field_validator
+from typing_extensions import TypedDict, override
 
 # import diskcache as dc
 from alcatraz.clusters._container_proc import ContainerProc
@@ -475,8 +485,9 @@ class BaseAlcatrazCluster(ABC):
             acr_registries = {
                 image.split(".azurecr.io")[0] for image in images if ".azurecr.io" in image
             }
-            for registry_name in acr_registries:
-                await _acr_login(registry_name)
+            if self.pull_from_registry:
+                for registry_name in acr_registries:
+                    await _acr_login(registry_name)
 
         if not docker_client_initialized:
             self.docker_client = await self._get_docker_client()

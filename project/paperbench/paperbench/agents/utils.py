@@ -1,14 +1,55 @@
+from __future__ import annotations
+
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
+
+import structlog.stdlib
+from pydantic import BaseModel
 
 from paperbench.constants import AGENT_DIR, CODE_DIR, LOGS_DIR, SUBMISSION_DIR
+
+logger = structlog.stdlib.get_logger(component=__name__)
 
 
 @dataclass
 class AgentDirConfig:
     agent_dir: str
     directories_to_save: list[str]
+
+
+class AgentOutput(BaseModel):
+    run_id: str
+    time_start: float
+    time_end: float
+    error_msg: str | None = None
+    runtime_in_seconds: float
+    status_exists: bool
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentOutput:
+        try:
+            return AgentOutput(
+                run_id=data["run_id"],
+                time_start=data["time_start"],
+                time_end=data["time_end"],
+                error_msg=data.get("error_msg"),
+                runtime_in_seconds=data["runtime_in_seconds"],
+                status_exists=data["status_exists"],
+            )
+        except KeyError as e:
+            raise ValueError("Missing required field in agent output") from e
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "time_start": self.time_start,
+            "time_end": self.time_end,
+            "error_msg": self.error_msg,
+            "runtime_in_seconds": self.runtime_in_seconds,
+            "status_exists": self.status_exists,
+        }
 
 
 def prepare_agent_dir_config() -> AgentDirConfig:
@@ -44,7 +85,7 @@ def is_env_var(value: str) -> bool:
     return get_env_var(value) is not None
 
 
-def parse_env_var_values(dictionary: dict) -> dict:
+def parse_env_var_values(dictionary: dict[str, str]) -> dict[str, str]:
     """
     Parses any values in the dictionary that match the ${{ secrets.ENV_VAR }} pattern and replaces
     them with the value of the ENV_VAR environment variable.
@@ -54,10 +95,13 @@ def parse_env_var_values(dictionary: dict) -> dict:
             continue
 
         env_var = get_env_var(value)
+        if env_var is None:
+            raise ValueError("Pattern did not yield an env-var name")
 
-        if os.getenv(env_var) is None:
+        env_val = os.getenv(env_var)
+        if env_val is None:
             raise ValueError(f"Environment variable `{env_var}` is not set!")
 
-        dictionary[key] = os.getenv(env_var)
+        dictionary[key] = env_val
 
     return dictionary

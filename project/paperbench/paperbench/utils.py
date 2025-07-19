@@ -1,21 +1,26 @@
 import io
 import logging
 import os
+import subprocess
 import tarfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, ParamSpec, Sequence, TypeVar
 
 import blobfile as bf
-import docker
+import numpy as np
 import openai
+import structlog.stdlib
 import tenacity
 import yaml
 from docker import DockerClient
 from docker.errors import DockerException
 
-logger = logging.getLogger(__name__)
+logger = structlog.stdlib.get_logger(component=__name__)
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def in_ci() -> bool:
@@ -37,51 +42,7 @@ def is_docker_running(timeout: float = 10.0) -> bool:
         return False
 
 
-class CustomFormatter(logging.Formatter):
-    def format(self, record):
-        levelname = record.levelname
-        message = record.getMessage()
-
-        level_colors = {
-            "DEBUG": "\033[38;5;39m",
-            "INFO": "\033[38;5;15m",
-            "WARNING": "\033[38;5;214m",
-            "ERROR": "\033[38;5;203m",
-            "CRITICAL": "\033[1;38;5;231;48;5;197m",
-        }
-
-        level_color = level_colors.get(levelname, "\033[0m")
-        record.levelname = f"{level_color}{levelname:<8}\033[0m"
-        record.asctime = f"\033[38;5;240m{self.formatTime(record, self.datefmt)}\033[0m"
-        record.custom_location = (
-            f"\033[38;5;240m{record.name}.{record.funcName}:{record.lineno}\033[0m"
-        )
-        record.msg = f"{level_color}{message}\033[0m"
-
-        return super().format(record)
-
-
-def get_logger(name: Optional[str] = None):
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-
-    if not logger.hasHandlers():
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG)
-        fmt = "%(asctime)s | %(levelname)s | %(custom_location)s - %(message)s"
-        datefmt = "%Y-%m-%d %H:%M:%S.%f"
-        formatter = CustomFormatter(fmt=fmt, datefmt=datefmt)
-
-        if os.environ.get("DISABLE_COLORED_LOGGING") == "1":
-            formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
-
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-    return logger
-
-
-def load_yaml(fpath: Path) -> dict:
+def load_yaml_dict(fpath: Path) -> dict[str, Any]:
     """Loads a YAML file and returns its contents as a dictionary."""
 
     assert isinstance(fpath, Path), f"Expected a `Path`, but got `{type(fpath)}`."
@@ -92,6 +53,10 @@ def load_yaml(fpath: Path) -> dict:
     with open(fpath, "r") as file:
         contents = yaml.safe_load(file)
 
+    assert isinstance(contents, dict), (
+        f"Expected to load a dictionary from YAML file, but got `{type(contents)}`."
+    )
+
     return contents
 
 
@@ -100,9 +65,9 @@ def get_root() -> Path:
 
     path = Path(__file__).parent.resolve()
 
-    assert (
-        path.name == "paperbench"
-    ), f"Expected the module directory to be `paperbench`, but got `{path.name}`."
+    assert path.name == "paperbench", (
+        f"Expected the module directory to be `paperbench`, but got `{path.name}`."
+    )
 
     return path
 
@@ -113,10 +78,23 @@ def get_paperbench_data_dir() -> Path:
     return get_root().parent / "data"
 
 
+def build_canonical_sub_path(run_dir: Path | str, timestamp: str) -> str:
+    """
+    The canonical place where we expect submission.tar.gz to be for repro and grading
+    """
+    return bf.join(run_dir, "submissions", timestamp, "submission.tar.gz")
+
+
 def get_experiments_dir() -> Path:
     """Returns an absolute path to the paperbench data directory."""
 
     return get_root().parent / "experiments"
+
+
+def find_dotenv() -> Path:
+    """Returns an absolute path to the .env file."""
+
+    return get_root().parent / ".env"
 
 
 def get_timestamp() -> str:
@@ -125,9 +103,32 @@ def get_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H-%M-%S-%Z", time.gmtime())
 
 
-def create_run_id(
-    paper_id: str,
-) -> str:
+def safe_mean(values: Sequence[float | int], default: float = np.nan) -> float:
+    """Return the mean or a default when no values are provided."""
+
+    assert isinstance(values, Sequence), "`values` must be a sequence"
+    assert all(isinstance(v, (int, float)) for v in values), "`values` must be numeric list"
+    assert isinstance(default, (int, float)), "`default` must be numeric"
+
+    if not values:
+        return float(default)
+
+    result = float(np.mean(values))
+
+    assert isinstance(result, (int, float)), (
+        f"Expected the mean to be a number, but got `{type(result)}`"
+    )
+
+    return result
+
+
+def get_commit_hash() -> str:
+    """Returns the current Git commit hash."""
+
+    return subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode("ascii")
+
+
+def create_run_id(paper_id: str) -> str:
     """Creates a run ID."""
 
     return f"{paper_id}_{str(uuid.uuid4())}"
@@ -172,10 +173,14 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
     wait=tenacity.wait_random_exponential(min=1, max=300),  # Max wait time of 5 minutes
     stop=tenacity.stop_after_delay(3600 * 2),  # Retry for up to 2 hours
     retry=tenacity.retry_if_exception_type(OPENAI_TIMEOUT_EXCEPTIONS),
-    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+    before_sleep=(
+        tenacity.before_sleep_log(logger._logger, logging.WARNING) if logger._logger else None
+    ),
     reraise=True,
 )
-async def oai_completion_with_retry_async(method: Callable, *args, **kwargs) -> Any:
+async def oai_completion_with_retry_async(
+    method: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
+) -> R:
     return await method(*args, **kwargs)
 
 
@@ -183,8 +188,10 @@ async def oai_completion_with_retry_async(method: Callable, *args, **kwargs) -> 
     wait=tenacity.wait_random_exponential(min=1, max=300),  # Max wait time of 5 minutes
     stop=tenacity.stop_after_delay(3600 * 2),  # Retry for up to 2 hours
     retry=tenacity.retry_if_exception_type(OPENAI_TIMEOUT_EXCEPTIONS),
-    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+    before_sleep=(
+        tenacity.before_sleep_log(logger._logger, logging.WARNING) if logger._logger else None
+    ),
     reraise=True,
 )
-def oai_completion_with_retry(method: Callable, *args, **kwargs) -> Any:
+def oai_completion_with_retry(method: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
     return method(*args, **kwargs)

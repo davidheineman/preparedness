@@ -15,21 +15,22 @@ import aiodebug.hang_inspection
 import aiodebug.log_slow_callbacks
 import blobfile as bf
 import dill
-import nanoeval._db as db
 import psutil
 import structlog.stdlib
+from structlog.contextvars import bound_contextvars
+
+import nanoeval._db as db
 from nanoeval import monitor as monitor
 from nanoeval._aiomonitor import start_aiomonitor
 from nanoeval._db import as_default_db, default_db
 from nanoeval._loop_watcher import start_loop_watcher
 from nanoeval._multiprocessing_utils import get_loky_executor, multiprocess_stop_signal
 from nanoeval._persistent_db import PersistentDb
-from nanoeval.eval import EvalSpec, RetryableSystemError, RunnerArgs, Task
+from nanoeval.eval import EvalSpec, RolloutSystemError, RunnerArgs, Task
 from nanoeval.fs_paths import stacktrace_root_dir
 from nanoeval.library_config import LibraryConfig, get_library_config, set_library_config
 from nanoeval.recorder import RecorderProtocol, set_default_recorder
 from nanoeval.setup import global_exit_stack, nanoeval_logging, properly_closed_thread_pool
-from structlog.contextvars import bound_contextvars
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
@@ -68,22 +69,8 @@ _record_ctxs: dict[str, _ContextManagerSemaphore[RecorderProtocol]] = dict()
 
 
 async def _eval_task(recorder: RecorderProtocol, spec: EvalSpec, task: Task) -> None:
-    group_id = task.question_id + "." + str(task.attempt_id) + "." + str(task.retry_idx)
-    group_id_suffix = f"{task.attempt_id}.{task.retry_idx}"
-
     async with AsyncExitStack() as stack:
-        # Create a shared recorder ctx for this run_id
-        if recorder.run_spec.run_id not in _record_ctxs:
-            _record_ctxs[recorder.run_spec.run_id] = _ContextManagerSemaphore(recorder)
-        stack.enter_context(_record_ctxs[recorder.run_spec.run_id])
-
-        stack.enter_context(
-            set_default_recorder(
-                recorder,
-                sample_id=task.question_id,
-                group_id=group_id_suffix,
-            )
-        )
+        group_id = task.question_id + "." + str(task.attempt_id) + "." + str(task.retry_idx)
         stack.enter_context(
             bound_contextvars(
                 run_id=recorder.run_spec.run_id,
@@ -98,7 +85,7 @@ async def _eval_task(recorder: RecorderProtocol, spec: EvalSpec, task: Task) -> 
             try:
                 result = await spec.eval.evaluate(task)
             except asyncio.CancelledError as e:
-                raise RetryableSystemError(
+                raise RolloutSystemError(
                     "Nanoeval task was canceled. This is not allowed (typically symptomatic of a bug) and will trigger a task restart."
                 ) from e
 
@@ -121,7 +108,7 @@ async def _eval_task(recorder: RecorderProtocol, spec: EvalSpec, task: Task) -> 
                 conn.commit()
                 logger.info("Saved result to %s.%s", recorder.run_spec.run_id, group_id)
 
-        except RetryableSystemError as e:
+        except RolloutSystemError as e:
             # Save this exception to the monitor. Don't crash. Main process will automatically
             # requeue the task.
             with db.conn() as conn:
@@ -302,25 +289,44 @@ async def _executor_worker_async_main(stop_signal: threading.Event) -> None:
             logger.info(
                 "Evaluating task %s.%s.%s", task.question_id, task.attempt_id, task.retry_idx
             )
-            try:
-                # Only __aenter__ once in this process
-                if recorder.run_spec.run_id not in eval_spec_cache:
-                    eval_spec_cache[recorder.run_spec.run_id] = eval_spec
-                    try:
-                        await eval_spec.eval.__aenter__()
-                    except AttributeError:
-                        # We don't care about double-enters
-                        pass
-                spec = eval_spec_cache[recorder.run_spec.run_id]
-                await _eval_task(recorder, spec, task)
-            except BaseException as e:
-                # Omg, the task threw an exception. This is not ok, nanoeval tasks should never raise unless something bad
-                # happened.
-                # In this case, we always want to reraise a new error and terminate the worker.
-                # we use BaseException because some errors e.g. CancelledError go silently into the night. We need to
-                # reraise a standard exception because we want to hard crash here.
-                logger.exception("Error in process_task")
-                raise RuntimeError("An evaluation task crashed with an unhandled exception") from e
+            async with AsyncExitStack() as stack:
+                group_id_suffix = f"{task.attempt_id}.{task.retry_idx}"
+
+                # Enter the recorder. We do this before __aenter__.
+                # Create a shared recorder ctx for this run_id
+                if recorder.run_spec.run_id not in _record_ctxs:
+                    _record_ctxs[recorder.run_spec.run_id] = _ContextManagerSemaphore(recorder)
+                stack.enter_context(_record_ctxs[recorder.run_spec.run_id])
+                stack.enter_context(
+                    set_default_recorder(
+                        recorder,
+                        sample_id=task.question_id,
+                        group_id=group_id_suffix,
+                    )
+                )
+
+                try:
+                    # Only __aenter__ once in this process
+                    if recorder.run_spec.run_id not in eval_spec_cache:
+                        eval_spec_cache[recorder.run_spec.run_id] = eval_spec
+                        try:
+                            logger.info("Calling __aenter__ to enter eval context", eval=eval_spec)
+                            await eval_spec.eval.__aenter__()
+                        except AttributeError:
+                            # We don't care about double-enters
+                            pass
+                    spec = eval_spec_cache[recorder.run_spec.run_id]
+                    await _eval_task(recorder, spec, task)
+                except BaseException as e:
+                    # Omg, the task threw an exception. This is not ok, nanoeval tasks should never raise unless something bad
+                    # happened.
+                    # In this case, we always want to reraise a new error and terminate the worker.
+                    # we use BaseException because some errors e.g. CancelledError go silently into the night. We need to
+                    # reraise a standard exception because we want to hard crash here.
+                    logger.exception("Error in process_task")
+                    raise RuntimeError(
+                        "An evaluation task crashed with an unhandled exception"
+                    ) from e
 
         try:
             async with asyncio.TaskGroup() as tg:

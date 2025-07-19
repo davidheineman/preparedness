@@ -1,10 +1,23 @@
-import asyncio
-import logging
-import time
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from __future__ import annotations
 
+import asyncio
+import json
+import time
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+import blobfile as bf
+import structlog.stdlib
+from structlog.stdlib import BoundLogger
+
+from alcatraz.clusters.local import ClusterConfig
 from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface
+from paperbench.agents.registry import get_agents_env_vars, registry
+from paperbench.infra.alcatraz import tar_and_extract_from_computer
+from paperbench.scripts.alcatraz_services import put_submission_in_computer, start_alcatraz_computer
+
+logger = structlog.stdlib.get_logger(component=__name__)
 
 
 @dataclass(frozen=True)
@@ -12,33 +25,37 @@ class ReproductionMetadata:
     is_valid_git_repo: bool
     git_log: str
     repro_script_exists: bool
-    repro_execution_time: float
     files_before_reproduce: str
     files_after_reproduce: str
-    git_status_after_reproduce: str
     timedout: bool
     repro_log: str
-    retried_results: list[dict] = field(default_factory=list)
+    retried_results: list[ReproScriptRunOutcome] = field(default_factory=list)
+    repro_execution_time: float | None = None
+    git_status_after_reproduce: str | None = None
+    executed_submission: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ReproductionMetadata":
+    def from_dict(cls, data: dict[str, Any]) -> ReproductionMetadata:
         try:
+            retried_results = [ReproScriptRunOutcome.from_dict(r) for r in data["retried_results"]]
+
             return cls(
                 is_valid_git_repo=data["is_valid_git_repo"],
                 git_log=data["git_log"],
                 repro_script_exists=data["repro_script_exists"],
-                repro_execution_time=data["repro_execution_time"],
-                repro_log=data["repro_log"],
                 files_before_reproduce=data["files_before_reproduce"],
                 files_after_reproduce=data["files_after_reproduce"],
-                git_status_after_reproduce=data["git_status_after_reproduce"],
                 timedout=data["timedout"],
-                retried_results=data["retried_results"],
+                repro_log=data["repro_log"],
+                retried_results=retried_results,
+                repro_execution_time=data["repro_execution_time"],
+                git_status_after_reproduce=data["git_status_after_reproduce"],
+                executed_submission=data["executed_submission"],
             )
         except KeyError as e:
-            raise ValueError(f"Missing required field in reproduction metadata: {e}")
+            raise ValueError("Missing required field in reproduction metadata") from e
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -48,10 +65,21 @@ class ReproScriptRunOutcome:
     timedout: bool
     repro_log: str
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReproScriptRunOutcome:
+        try:
+            return cls(
+                repro_execution_time=data["repro_execution_time"],
+                timedout=data["timedout"],
+                repro_log=data["repro_log"],
+            )
+        except KeyError as e:
+            raise ValueError("Missing required field in reproduction script run outcome") from e
+
 
 async def run_reproduce_script(
     computer: ComputerInterface,
-    logger: logging.Logger,
+    logger: BoundLogger,
     submission_path: Path,
     timeout: float | None,
     use_py3_11: bool = False,  # defaults to 3.12
@@ -99,18 +127,19 @@ async def run_reproduce_script(
 async def reproduce(
     computer: ComputerInterface,
     submission_path: Path,
-    logger: logging.Logger,
+    logger: BoundLogger,
     timeout: float | None = None,
-    retry_threshold: float = 0,
-) -> dict:
+    use_py3_11: bool = False,
+    make_venv: bool = False,
+) -> ReproductionMetadata:
     """
     args:
         computer: ComputerInterface on which the reproduce.sh script will be run
         submission_path: Path to the submission directory
         logger: Logger object to log messages
         timeout: (optional) Timeout for the reproduce.sh script
-        retry_threshold: (optional) If greater than 0 and timeout, when the reproduce.sh runs for
-            less than this threshold of seconds, it is retried with series of arbitrary/generic fixes
+        use_py3_11: (optional) Whether to switch python3 to python3.11 before running
+        make_venv: (optional) Whether to create and use a virtualenv before running
     """
     # get git history for interest
     cmd_str = f"bash -c 'cd {submission_path} && git --no-pager log'"
@@ -131,51 +160,28 @@ async def reproduce(
     repro_script_exists = result.exit_code == 0
     logger.info(f"Reproduce script exists at {reproduce_script_path}: {repro_script_exists}")
     if not repro_script_exists:
-        return asdict(
-            ReproductionMetadata(
-                is_valid_git_repo=is_valid_git_repo,
-                git_log=git_log,
-                repro_script_exists=repro_script_exists,
-                repro_execution_time=0,
-                repro_log="reproduce.sh not found",
-                files_before_reproduce=files_before_reproduce,
-                files_after_reproduce=files_before_reproduce,
-                git_status_after_reproduce="",
-                timedout=False,
-            )
+        return ReproductionMetadata(
+            is_valid_git_repo=is_valid_git_repo,
+            git_log=git_log,
+            repro_script_exists=repro_script_exists,
+            repro_log="reproduce.sh not found",
+            files_before_reproduce=files_before_reproduce,
+            files_after_reproduce=files_before_reproduce,
+            timedout=False,
         )
 
     # sometimes git complains about `detected dubious ownership in repository` due to mismatching file ownership
     cmd_str = f"bash -c 'git config --global --add safe.directory {submission_path}'"
     await computer.send_shell_command(cmd_str)
 
-    results = []
-    result = await run_reproduce_script(computer, logger, submission_path, timeout)
-    results.append(result)
-
-    valid_threshold = True if timeout is None else retry_threshold < timeout
-    retries_enabled = retry_threshold > 0 and valid_threshold
-    script_ran_quickly = result.repro_execution_time <= retry_threshold
-
-    # only ran shortly, something trivial might be broken: maybe trivial fixes help, so retry
-    if retries_enabled and script_ran_quickly:
-        logger.info("Reproduce.sh ran for <= 10 minutes, retrying with small fixes")
-        retry_options = [
-            {"use_py3_11": True, "make_venv": False},
-            {"use_py3_11": False, "make_venv": True},
-            {"use_py3_11": True, "make_venv": True},
-        ]
-        for retry_opts in retry_options:
-            result = await run_reproduce_script(
-                computer, logger, submission_path, timeout, **retry_opts
-            )
-            results.append(result)
-            if result.repro_execution_time > retry_threshold:
-                logger.info("Reproduce.sh ran for more than 10 minutes, breaking out of retry loop")
-                break
-        if result.repro_execution_time <= retry_threshold:
-            logger.info("Reproduce.sh still ran for <= 10 minutes, giving up")
-    final_result = results[-1]
+    repro_outcome = await run_reproduce_script(
+        computer=computer,
+        logger=logger,
+        submission_path=submission_path,
+        timeout=timeout,
+        use_py3_11=use_py3_11,
+        make_venv=make_venv,
+    )
 
     result = await computer.check_shell_command(f"ls -la {submission_path}")
     files_after_reproduce = result.output.decode("utf-8")
@@ -183,17 +189,165 @@ async def reproduce(
     result = await computer.send_shell_command(f"cd {submission_path} && git status")
     git_status = result.output.decode("utf-8")
 
-    return asdict(
-        ReproductionMetadata(
-            is_valid_git_repo=is_valid_git_repo,
-            git_log=git_log,
-            repro_script_exists=repro_script_exists,
-            repro_execution_time=final_result.repro_execution_time,
-            repro_log=final_result.repro_log,
-            files_before_reproduce=files_before_reproduce,
-            files_after_reproduce=files_after_reproduce,
-            git_status_after_reproduce=git_status,
-            timedout=final_result.timedout,
-            retried_results=[asdict(r) for r in results[:-1]],
-        )
+    return ReproductionMetadata(
+        is_valid_git_repo=is_valid_git_repo,
+        git_log=git_log,
+        repro_script_exists=repro_script_exists,
+        repro_execution_time=repro_outcome.repro_execution_time,
+        repro_log=repro_outcome.repro_log,
+        files_before_reproduce=files_before_reproduce,
+        files_after_reproduce=files_after_reproduce,
+        git_status_after_reproduce=git_status,
+        timedout=repro_outcome.timedout,
+        # will populate retried_results and executed_submission later
     )
+
+
+async def reproduce_on_computer(
+    cluster_config: ClusterConfig,  # TODO: don't assume AlcatrazComputerInterface
+    submission_path: str,
+    logger: BoundLogger,
+    run_dir: str,
+    submission_cluster_path: Path = Path("/submission"),
+    output_cluster_path: Path = Path("/output"),
+    timeout: float | None = None,
+    use_py3_11: bool = False,
+    make_venv: bool = False,
+) -> ReproductionMetadata:
+    """
+    Reproduce a single submission on a computer.
+
+    This script will spin up a pb-reproducer container on the computer to do the following:
+    - Download the submission
+    - Run the reproduction script
+    - Save and return the reproduction results
+    """
+    # we're ensuring the env variables defined in agent.env are set on the computer
+    cluster_config = cluster_config.model_copy(
+        update={"environment": {**cluster_config.environment, **get_agents_env_vars(registry)}}
+    )
+    async with start_alcatraz_computer(cluster_config) as computer:
+        time_start = time.time()
+
+        await computer.check_shell_command(
+            f"mkdir -p {output_cluster_path} {submission_cluster_path}"
+        )
+
+        # Step 1: Put submission to /submission
+        await put_submission_in_computer(computer, submission_path, logger)
+
+        # Step 2: Run reproduction
+        repro_metadata = await reproduce(
+            computer=computer,
+            submission_path=submission_cluster_path,
+            logger=logger,
+            timeout=timeout,
+            use_py3_11=use_py3_11,
+            make_venv=make_venv,
+        )
+
+        # Step 3: Save metadata
+        path_to_output = submission_path.replace(".tar.gz", "_executed_metadata.json")
+        bf.write_bytes(path_to_output, json.dumps(repro_metadata.to_dict()).encode("utf-8"))
+
+        # Step 4: Save the reproduced submission itself
+        timestamp = Path(submission_path).parts[-2]
+        upload_from = output_cluster_path / "submission_executed.tar.gz"
+        upload_to = bf.join(run_dir, "submissions", timestamp, "submission_executed.tar.gz")
+        await tar_and_extract_from_computer(
+            computer=computer,
+            dir_path_on_computer=submission_cluster_path,
+            tar_path_on_computer=upload_from,
+            tar_path_on_target=upload_to,
+            max_file_size="10M",
+            logger=logger,
+        )
+
+        logger.info(f"Reproduced dir has been written: {upload_to}")
+
+        time_end = time.time()
+        logger.info(f"Reproduction completed in {time_end - time_start:.2f} seconds.")
+
+        return repro_metadata
+
+
+async def reproduce_on_computer_with_salvaging(
+    cluster_config: ClusterConfig,
+    submission_path: str,
+    logger: BoundLogger,
+    run_dir: str,
+    submission_cluster_path: Path = Path("/submission"),
+    output_cluster_path: Path = Path("/output"),
+    timeout: float | None = None,
+    retry_threshold: float = 0,
+) -> ReproductionMetadata:
+    """
+    Reproduce a single submission on a computer,
+    salvaging reproduce attempts by retrying with slightly different configurations.
+    """
+    valid_threshold = True if timeout is None else retry_threshold < timeout
+    retries_enabled = retry_threshold > 0 and valid_threshold
+
+    retry_options = [{"use_py3_11": False, "make_venv": False}]
+    if retries_enabled:
+        retry_options.extend(
+            [
+                {"use_py3_11": True, "make_venv": False},
+                {"use_py3_11": False, "make_venv": True},
+                {"use_py3_11": True, "make_venv": True},
+            ]
+        )
+
+    repro_attempts: list[ReproductionMetadata] = []
+
+    for opts in retry_options:
+        logger.info(
+            f"Executing reproduce.sh with py3_11={opts['use_py3_11']}"
+            f" and make_venv={opts['make_venv']}"
+        )
+        repro_attempt = await reproduce_on_computer(
+            cluster_config=cluster_config,
+            submission_path=submission_path,
+            logger=logger,
+            run_dir=run_dir,
+            submission_cluster_path=submission_cluster_path,
+            output_cluster_path=output_cluster_path,
+            timeout=timeout,
+            use_py3_11=opts["use_py3_11"],
+            make_venv=opts["make_venv"],
+        )
+        repro_attempts.append(repro_attempt)
+        if _should_retry(retries_enabled, repro_attempt, retry_threshold):
+            logger.info(
+                f"Reproduction attempt ran for less than {retry_threshold} seconds,"
+                " retrying with different configuration.",
+            )
+            continue  # retry, with next configuration
+        else:
+            break  # this last attempt was it
+
+    repro_metadata = repro_attempts[-1]
+    repro_metadata = _populate_retried_results(repro_metadata, repro_attempts[:-1])
+
+    return repro_metadata
+
+
+def _should_retry(
+    retries_enabled: bool, repro_attempt: ReproductionMetadata, retry_threshold: float
+) -> bool:
+    """helper for determining whether we should retry to run reproduce.sh"""
+    execution_time = repro_attempt.repro_execution_time or 0
+    return retries_enabled and execution_time < retry_threshold
+
+
+def _populate_retried_results(
+    repro_metadata: ReproductionMetadata, repro_attempts: list[ReproductionMetadata]
+) -> ReproductionMetadata:
+    """Populates a ReproductionMetadata.retried_results with info from previous attempts"""
+    if len(repro_attempts) >= 1:
+        retried = [
+            ReproScriptRunOutcome(float(m.repro_execution_time or 0), m.timedout, m.repro_log)
+            for m in repro_attempts
+        ]
+        repro_metadata = replace(repro_metadata, retried_results=retried)
+    return repro_metadata

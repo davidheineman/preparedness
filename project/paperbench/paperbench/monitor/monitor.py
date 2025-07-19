@@ -1,15 +1,15 @@
-import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import Any
 
-from paperbench.paper_registry import Paper
-from paperbench.utils import get_logger
+import blobfile as bf
+import structlog.stdlib
 from unidecode import unidecode
 
-logger = get_logger(__name__)
+from paperbench.paper_registry import Paper
+
+logger = structlog.stdlib.get_logger(component=__name__)
 
 
 @dataclass
@@ -18,17 +18,34 @@ class ViolationContext:
 
     line_number: int  # 1-indexed line number where violation was found
     violation: str  # The actual violation (blacklisted URL)
-    context: List[str]  # Lines of context around the violation
+    context: list[str]  # Lines of context around the violation
     context_start: int  # 1-indexed line number where context starts
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the violation context to a dictionary."""
+        return {
+            "line_number": self.line_number,
+            "violation": self.violation,
+            "context": self.context,
+            "context_start": self.context_start,
+        }
 
 
 @dataclass
 class MonitorResult:
     """Result from monitoring an agent's logs."""
 
-    violations: List[ViolationContext]  # List of violations found
+    violations: list[ViolationContext]  # List of violations found
     explanation: str  # Explanation of violations or why there were none
-    log_file: Path  # Path to the log file that was checked
+    log_file: str  # blobfile path to the log file that was checked
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the monitor result to a dictionary."""
+        return {
+            "violations": [v.to_dict() for v in self.violations],
+            "explanation": self.explanation,
+            "log_file": self.log_file,
+        }
 
 
 class Monitor(ABC):
@@ -55,7 +72,7 @@ class Monitor(ABC):
                 self.blacklist = []
 
     @abstractmethod
-    def check_log(self, log_file: Path) -> MonitorResult:
+    def check_log(self, log_file: str) -> MonitorResult:
         """Check a log file for violations of monitoring rules."""
         raise NotImplementedError()
 
@@ -72,8 +89,8 @@ class BasicMonitor(Monitor):
         return url.strip()
 
     def _get_context_lines(
-        self, lines: List[str], violation_line: int, context_size: int = 3
-    ) -> tuple[List[str], int]:
+        self, lines: list[str], violation_line: int, context_size: int = 3
+    ) -> tuple[list[str], int]:
         """Get context lines around a violation.
 
         Args:
@@ -88,7 +105,7 @@ class BasicMonitor(Monitor):
         end = min(len(lines), violation_line + context_size)  # No -1 needed since end is exclusive
         return lines[start:end], start + 1  # +1 to convert back to 1-indexed
 
-    def _contains_command(self, context: List[str]) -> bool:
+    def _contains_command(self, context: list[str]) -> bool:
         """Check if the context contains git clone, curl, or wget commands.
 
         Args:
@@ -105,16 +122,16 @@ class BasicMonitor(Monitor):
                     return True
         return False
 
-    def check_log(self, log_file: Path) -> MonitorResult:
+    def check_log(self, log_file: str) -> MonitorResult:
         """Check a log file for violations of the blacklist.
 
         Args:
-            log_file: Path to the log file to check
+            log_file: blobfile path to the log file to check
 
         Returns:
             MonitorResult containing any violations found
         """
-        if not log_file.exists():
+        if not bf.exists(log_file):
             return MonitorResult(
                 violations=[],
                 explanation=f"Log file not found at {log_file}",
@@ -129,7 +146,7 @@ class BasicMonitor(Monitor):
             )
 
         violations = []
-        with open(log_file, "r") as f:
+        with bf.BlobFile(log_file, "r") as f:
             lines = f.readlines()
             for i, line in enumerate(lines, start=1):
                 line = line.strip()
