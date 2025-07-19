@@ -60,6 +60,17 @@ from alcatraz.clusters.interface import (
     AlcatrazUnexpectedSystemError,
     ExecutionResult,
 )
+from alcatraz.clusters._debug_utils import test_docker_ports, test_socat_ports, verify_socat_ports
+from docker import DockerClient
+from docker.errors import APIError, NotFound
+from docker.models.containers import Container, ExecResult
+from docker.models.networks import Network
+from filelock import Timeout as LockTimeout
+from filelock import UnixFileLock
+from jupyter_client.asynchronous.client import AsyncKernelClient
+from jupyter_client.manager import AsyncKernelManager
+from pydantic import BaseModel, ConfigDict, Extra, Field, field_validator
+from typing_extensions import TypedDict, override
 
 logger = logging.getLogger(__name__)
 
@@ -659,16 +670,23 @@ class BaseAlcatrazCluster(ABC):
         while time.monotonic() - start_time < 60:
             container = self.docker_client.containers.get(container_id)
             attrs = cast(Any, container.attrs)
-            if "Health" not in attrs["State"]:
-                logger.warning("Container health not available for this container, ignoring.")
-                return True
-            status = attrs["State"]["Health"]["Status"]
-            if status == "healthy":
-                return True
-            elif status == "unhealthy":
-                print("Container became unhealthy.")
+            # @davidh: no skipping container health !
+            # print('@davidh says hello')
+            if "Health" in attrs["State"]:
+                status = attrs["State"]["Health"]["Status"]
+                if status == "healthy":
+                    return True
+                elif status == "unhealthy":
+                    print("Container became unhealthy.")
                 return False
-            time.sleep(0.2)  # Check every 10 seconds
+            elif attrs["State"].get("Status") == "running":
+                # If healthcheck is disabled, but container is running. We can still connect
+                return True
+            else:
+                logger.warning("Container health not available for this container, waiting.")
+                logger.debug("Container attributes: " + str(attrs))
+
+            time.sleep(10)  # Check every 10 seconds
 
         print("Timeout reached without becoming healthy.")
         return False
@@ -932,6 +950,38 @@ class BaseAlcatrazCluster(ABC):
 
         logger.info("Connection file: %s", connection_file)
 
+
+        ######## @david: DinD support
+
+        # When running Docker in Docker (DinD), we will attempt to connect to the host port when
+        # we need to connect to the parent container's port. This will detect and attach to that port
+
+        # After getting the connection file and before connecting to kernel
+        # Replace the IP in the connection file with the Docker host IP
+
+        # Get Docker host IP from container's perspective
+        try:
+            result = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.split('\n'):
+                if 'default' in line:
+                    docker_host_ip = line.split()[2]
+                    break
+            else:
+                docker_host_ip = '172.17.0.1'  # Default Docker bridge gateway
+            
+            logger.info(f"Detected Docker host IP: {docker_host_ip}")
+            
+            # Update connection file to use Docker host IP instead of 0.0.0.0
+            connection_file['ip'] = docker_host_ip
+            
+        except Exception as e:
+            logger.error(f"Failed to detect Docker host IP: {e}")
+            # Fallback to common Docker host IPs
+            docker_host_ip = '172.17.0.1'
+            connection_file['ip'] = docker_host_ip
+
+        ########
+
         return connection_file
 
     async def _ensure_jupyter_installed(self, force_python_install: bool) -> None:
@@ -1085,6 +1135,9 @@ class BaseAlcatrazCluster(ABC):
             # override socat entrypoint with a placeholder. We'll call socat ourselves and many times not just once!
         )
         logger.info("forwarding ports %s", ports_to_forward)
+
+        test_socat_ports(self, logger)
+
         await asyncio.gather(
             *(
                 asyncio.to_thread(
@@ -1099,6 +1152,8 @@ class BaseAlcatrazCluster(ABC):
                 for p in ports_to_forward
             )
         )
+
+        verify_socat_ports(self, logger, ports_to_forward)
 
         # Replace the ports in the connection file with the host ports
         for k, v in connection_file.items():
@@ -1134,6 +1189,8 @@ class BaseAlcatrazCluster(ABC):
             await self._km.cleanup_resources()
 
         self._exit_stack.push_async_callback(cleanup)
+
+        test_docker_ports(self, logger, host_port_leases, ports_to_forward)
 
         await self._kernel.wait_for_ready(timeout=ALCATRAZ_TIMEOUT)
         assert await self.kernel_is_alive()
