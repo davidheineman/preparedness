@@ -163,8 +163,22 @@ async def run_eval_in_database(run_id: str) -> dict[str, Any]:
             results: list[tuple[Task, Any]] = []
             last_summary_time = time.monotonic()
 
-            # Wait for the results
+            # Wait for the results with timeout and cancellation handling
+            start_wait_time = time.monotonic()
+            max_wait_time = spec.runner.max_wait_time
+            
             while True:
+                # Check for timeout
+                if time.monotonic() - start_wait_time > max_wait_time:
+                    logger.error("Evaluation timed out after %d seconds. No progress made.", max_wait_time)
+                    raise TimeoutError(f"Evaluation timed out after {max_wait_time} seconds")
+                
+                # Check for cancellation
+                try:
+                    await asyncio.sleep(0.5)  # Shorter sleep for better cancellation responsiveness
+                except asyncio.CancelledError:
+                    logger.info("Evaluation cancelled by user")
+                    raise
                 results.clear()
                 with db.conn() as conn:
                     cur = conn.execute(
@@ -195,6 +209,31 @@ async def run_eval_in_database(run_id: str) -> dict[str, Any]:
                         task = cached_deserialize(row[0])
                         result = cached_deserialize(row[1])
                         results.append((task, result))
+
+                # Check for progress and log if stuck
+                current_progress_count = len(results)
+                if current_progress_count > 0:
+                    # Reset progress timer if we have results
+                    start_wait_time = time.monotonic()
+                elif time.monotonic() - start_wait_time > 300:  # 5 minutes without progress
+                    # logger.warning("No progress for 5 minutes. Current progress: %d/%d tasks", current_progress_count, num_tasks)
+                    # Check if executor workers are still alive
+                    try:
+                        with db.conn() as conn:
+                            cursor = conn.execute(
+                                """
+                                SELECT COUNT(DISTINCT executor_pid) 
+                                FROM task 
+                                WHERE eval_id = ? AND executor_pid IS NOT NULL
+                                """,
+                                (recorder.run_spec.run_id,)
+                            )
+                            active_executors = cursor.fetchone()[0]
+                            if active_executors == 0:
+                                logger.error("No active executor workers found. Evaluation may be stuck.")
+                                raise RuntimeError("No active executor workers found")
+                    except Exception as e:
+                        logger.error("Failed to check executor status: %s", e)
 
                 # Collate the cleanest tasks (aka the last retry idx for each one)
                 clean_results = _create_clean_results(results)
@@ -281,8 +320,6 @@ async def run_eval_in_database(run_id: str) -> dict[str, Any]:
                 # Completed all tasks in the db
                 if len(results) == num_tasks:
                     break
-
-                await asyncio.sleep(1)
 
             # We made it!!!
             logger.info("Got back all results!", _print=True)

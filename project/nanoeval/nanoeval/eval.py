@@ -242,6 +242,10 @@ class RunnerArgs:
         default=True,
         doc="If enabled, backup the run state database to Azure Blob Storage.",
     )
+    max_wait_time: float = chz.field(
+        default=3600.0,
+        doc="Maximum time to wait for evaluation completion in seconds. If exceeded, evaluation will timeout and fail.",
+    )
 
     @chz.validate
     def _validate_slackbot_options(self) -> None:
@@ -269,6 +273,11 @@ class RunnerArgs:
                 raise ValueError(
                     "concurrency must be > 0 or None unless NANOEVAL_ALLOW_ZERO_CONCURRENCY is set."
                 )
+
+    @chz.validate
+    def _validate_timeout(self) -> None:
+        if self.max_wait_time <= 0:
+            raise ValueError("max_wait_time must be > 0")
 
 
 @chz.chz

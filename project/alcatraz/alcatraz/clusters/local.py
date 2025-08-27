@@ -753,7 +753,7 @@ class BaseAlcatrazCluster(ABC):
             container = self.docker_client.containers.get(container_id)
             attrs = cast(Any, container.attrs)
             if "Health" not in attrs["State"]:
-                logger.warning("Container health not available for this container, ignoring.")
+                # logger.warning("Container health not available for this container, ignoring.")
                 return True
             status = attrs["State"]["Health"]["Status"]
             if status == "healthy":
@@ -1033,6 +1033,37 @@ class BaseAlcatrazCluster(ABC):
                 await asyncio.sleep(0.1)
 
         logger.info("Connection file: %s", connection_file)
+
+        ######## @david: DinD support
+
+        # When running Docker in Docker (DinD), we will attempt to connect to the host port when
+        # we need to connect to the parent container's port. This will detect and attach to that port
+
+        # After getting the connection file and before connecting to kernel
+        # Replace the IP in the connection file with the Docker host IP
+
+        # Get Docker host IP from container's perspective
+        try:
+            result = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.split('\n'):
+                if 'default' in line:
+                    docker_host_ip = line.split()[2]
+                    break
+            else:
+                docker_host_ip = '172.17.0.1'  # Default Docker bridge gateway
+
+            logger.info(f"Detected Docker host IP: {docker_host_ip}")
+
+            # Update connection file to use Docker host IP instead of 0.0.0.0
+            connection_file['ip'] = docker_host_ip
+
+        except Exception as e:
+            logger.error(f"Failed to detect Docker host IP: {e}")
+            # Fallback to common Docker host IPs
+            docker_host_ip = '172.17.0.1'
+            connection_file['ip'] = docker_host_ip
+
+        ########
 
         return connection_file
 
