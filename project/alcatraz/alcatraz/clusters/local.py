@@ -806,6 +806,8 @@ class BaseAlcatrazCluster(ABC):
 
         if type(cmd) is not str:
             raise ValueError(f"cmd must be of type string, but it was type {type(cmd)}")
+
+        print(["sh", "-c", cmd])
         exit_code, result = await asyncio.to_thread(
             self.containers[container_id].exec_run,
             cmd=(
