@@ -176,8 +176,8 @@ class ClaudeCodeSolver(PythonCodingSolver):
                     # Second: invoke claude reading from that file
                     cmd = (
                         "source ~/.bashrc; "
-                        "/root/.nvm/versions/node/v22.18.0/bin/node "
-                        "/root/.nvm/versions/node/v22.18.0/bin/claude "
+                        "/root/.nvm/versions/node/v22.19.0/bin/node "
+                        "/root/.nvm/versions/node/v22.19.0/bin/claude "
                         "--verbose --output-format stream-json "
                         f"-p \"$(cat {prompt_path})\" "
                         f"--allowedTools {' '.join(ALLOWED_TOOLS)}"
