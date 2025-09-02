@@ -196,9 +196,9 @@ class ClaudeCodeSolver(PythonCodingSolver):
                     print(f'claude code failed: {e}')
                     # raise RuntimeError(f'claude code failed: {e}')
 
-                    ctx_logger.info("Pausing...", destinations=["run"])
-                    print("Pausing...")
-                    execution_res = await computer.check_shell_command("sleep 6000")
+                    # ctx_logger.info("Pausing...", destinations=["run"])
+                    # print("Pausing...")
+                    # execution_res = await computer.check_shell_command("sleep 6000")
 
                 # Grade and yield the final result
                 try:
