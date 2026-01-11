@@ -7,7 +7,7 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
 
 source "$HOME/.nvm/nvm.sh"
 
-nvm install 22
+nvm install 22.19.0
 npm -v
 
 npm install -g @anthropic-ai/claude-code@latest # @{{ version }}
