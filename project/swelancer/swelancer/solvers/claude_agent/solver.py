@@ -38,19 +38,23 @@ load_dotenv()
 STARTUP_TIMEOUT = 1200  # seconds (20 mins)
 
 ALLOWED_TOOLS = [
+    "Task",
+    "TaskOutput",
     "Bash",
-    "Edit",
-    "Write",
-    "Read",
     "Glob",
     "Grep",
-    "LS",
-    "WebFetch",
+    "ExitPlanMode",
+    "Read",
+    "Edit",
+    "Write",
     "NotebookEdit",
-    "NotebookRead",
-    "TodoRead",
+    "WebFetch",
     "TodoWrite",
-    "Agent",
+    "WebSearch",
+    "KillShell",
+    "AskUserQuestion",
+    "Skill",
+    "EnterPlanMode",
 ]
 
 

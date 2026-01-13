@@ -10,4 +10,4 @@ source "$HOME/.nvm/nvm.sh"
 nvm install 22.19.0
 npm -v
 
-npm install -g @anthropic-ai/claude-code@latest # @{{ version }}
+npm install -g @anthropic-ai/claude-code@2.1.6
